@@ -271,6 +271,8 @@ static int jp_value(JP* P, int* out) {
         d->num = strtod(num, &ep);
         if (*ep) goto done;
         d->type = J_NUM;
+        d->s = P->s + start;   // (the number as written, for api_pyjson)
+        d->slen = m;
         r = 0;
     }
 done:
@@ -529,5 +531,581 @@ int api_chat_parse(const char* body, size_t len, JNode* pool, int max, ChatReque
         req->seed = (unsigned)pool[sd].num;
         req->has_seed = 1;
     }
+    req->tools = -1;
+    int tl = json_get(pool, req->root, "tools");
+    if (tl >= 0 && pool[tl].type != J_NULL) {
+        if (pool[tl].type != J_ARR) {
+            *err = "'tools' must be an array.";
+            return -1;
+        }
+        for (int k = pool[tl].first; k >= 0; k = pool[k].next) {
+            int f = pool[k].type == J_OBJ ? json_get(pool, k, "function") : -1;
+            int nm = f >= 0 && pool[f].type == J_OBJ ? json_get(pool, f, "name") : -1;
+            if (nm < 0 || pool[nm].type != J_STR) {
+                *err = "Each tool must be {\"type\": \"function\", \"function\": {\"name\", ...}}.";
+                return -1;
+            }
+        }
+        int tc = json_get(pool, req->root, "tool_choice");
+        int none = tc >= 0 && pool[tc].type == J_STR && pool[tc].slen == 4 && !memcmp(pool[tc].s, "none", 4);
+        if (pool[tl].count > 0 && !none) req->tools = tl;
+    }
     return 0;
+}
+
+// ---- Qwen3.5's chat template ----------------------------------------------------------------------------------------
+
+// a string as json.dumps(ensure_ascii=False) writes it
+static void py_str(Sb* out, const char* p, size_t n) {
+    sb_add(out, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        const char* e = c == '"' ? "\\\"" : c == '\\' ? "\\\\" : c == '\n' ? "\\n" : c == '\r' ? "\\r" : c == '\t' ? "\\t"
+                      : c == '\b' ? "\\b" : c == '\f' ? "\\f" : NULL;
+        if (e) {
+            sb_str(out, e);
+        } else if (c < 0x20) {
+            char esc[8];
+            snprintf(esc, sizeof(esc), "\\u%04x", c);
+            sb_add(out, esc, 6);
+        } else {
+            sb_add(out, (const char*)&p[i], 1);
+        }
+    }
+    sb_add(out, "\"", 1);
+}
+
+static void py_jstr(Sb* out, const JNode* pool, int node) {
+    Sb d;
+    sb_init(&d);
+    json_str_sb(pool, node, &d);
+    py_str(out, d.p ? d.p : "", d.n);
+    sb_free(&d);
+}
+
+void api_pyjson(Sb* out, const JNode* pool, int node) {
+    const JNode* n = &pool[node];
+    switch (n->type) {
+    case J_NULL: sb_str(out, "null"); break;
+    case J_BOOL: sb_str(out, n->b ? "true" : "false"); break;
+    case J_NUM: sb_add(out, n->s, n->slen); break;
+    case J_STR: py_jstr(out, pool, node); break;
+    default: {
+        int obj = n->type == J_OBJ;
+        sb_str(out, obj ? "{" : "[");
+        for (int c = n->first; c >= 0; c = pool[c].next) {
+            if (c != n->first) sb_str(out, ", ");
+            if (obj) {
+                JNode k = pool[c];   // (the key, as a string node)
+                k.type = J_STR, k.s = k.key, k.slen = k.klen;
+                py_jstr(out, &k, 0);
+                sb_str(out, ": ");
+            }
+            api_pyjson(out, pool, c);
+        }
+        sb_str(out, obj ? "}" : "]");
+    }
+    }
+}
+
+static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+
+// Python's str.strip() of s[0, *n): returns the start, sets *n
+static const char* strip(const char* s, size_t* n) {
+    size_t a = 0, b = *n;
+    while (a < b && is_ws(s[a])) a++;
+    while (b > a && is_ws(s[b - 1])) b--;
+    *n = b - a;
+    return s + a;
+}
+
+static int has(const char* s, size_t n, const char* sub, const char** at) {
+    size_t m = strlen(sub);
+    for (size_t i = 0; i + m <= n; i++)
+        if (!memcmp(s + i, sub, m)) {
+            if (at) *at = s + i;
+            return 1;
+        }
+    return 0;
+}
+
+// the last occurrence of sub in s[0, n), or NULL
+static const char* last_of(const char* s, size_t n, const char* sub) {
+    size_t m = strlen(sub);
+    for (size_t i = n >= m ? n - m + 1 : 0; i-- > 0;)
+        if (!memcmp(s + i, sub, m)) return s + i;
+    return NULL;
+}
+
+static int role_is(const JNode* pool, int msg, const char* role) {
+    int r = json_get(pool, msg, "role");
+    size_t m = strlen(role);
+    return r >= 0 && pool[r].type == J_STR && pool[r].slen == m && !memcmp(pool[r].s, role, m);
+}
+
+// A value of a tool call's arguments as the template writes it: strings as they are, objects and lists as JSON,
+// anything else as Python's str() (True, False, None, numbers).
+static void arg_value(Sb* out, const JNode* pool, int v) {
+    switch (pool[v].type) {
+    case J_STR: json_str_sb(pool, v, out); break;
+    case J_OBJ:
+    case J_ARR: api_pyjson(out, pool, v); break;
+    case J_BOOL: sb_str(out, pool[v].b ? "True" : "False"); break;
+    case J_NULL: sb_str(out, "None"); break;
+    default: sb_add(out, pool[v].s, pool[v].slen);
+    }
+}
+
+static const char TOOLS_HEAD[] = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+static const char TOOLS_TAIL[] =
+    "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
+    "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+    "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified "
+    "format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural "
+    "language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question "
+    "like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+// One assistant tool call (OpenAI's {"function": {"name", "arguments": "<JSON>"}}, or name/arguments directly).
+static int render_call(Sb* out, const JNode* pool, int tc, int first, int had_content) {
+    int f = json_get(pool, tc, "function");
+    if (f < 0 || pool[f].type != J_OBJ) f = tc;
+    int nm = json_get(pool, f, "name");
+    if (nm < 0 || pool[nm].type != J_STR) return -1;
+    sb_str(out, first ? (had_content ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=") : "\n<tool_call>\n<function=");
+    json_str_sb(pool, nm, out);
+    sb_str(out, ">\n");
+    int a = json_get(pool, f, "arguments");
+    if (a >= 0 && pool[a].type != J_NULL) {
+        const JNode* ap = pool;
+        JNode* own = NULL;
+        Sb text;
+        sb_init(&text);
+        if (pool[a].type == J_STR) {   // OpenAI sends the arguments as a JSON string: read it
+            json_str_sb(pool, a, &text);
+            own = malloc(sizeof(JNode) * 2048);
+            int r = own && text.p ? json_parse(text.p, text.n, own, 2048) : -1;
+            if (r < 0 || own[r].type != J_OBJ) {
+                free(own);
+                sb_free(&text);
+                return -1;
+            }
+            ap = own, a = r;
+        }
+        if (ap[a].type == J_OBJ)
+            for (int k = ap[a].first; k >= 0; k = ap[k].next) {
+                JNode key = ap[k];
+                key.type = J_STR, key.s = key.key, key.slen = key.klen;
+                sb_str(out, "<parameter=");
+                json_str_sb(&key, 0, out);
+                sb_str(out, ">\n");
+                arg_value(out, ap, k);
+                sb_str(out, "\n</parameter>\n");
+            }
+        free(own);
+        sb_free(&text);
+    }
+    sb_str(out, "</function>\n</tool_call>");
+    return 0;
+}
+
+int api_render(const JNode* pool, const ChatRequest* cr, int think_block, Sb* out, size_t* stable, const char** err) {
+    int first = pool[cr->messages].first, n = pool[cr->messages].count;
+    int sys_first = role_is(pool, first, "system");
+    Sb c;
+    sb_init(&c);
+    if (cr->tools >= 0) {
+        sb_str(out, "<|im_start|>system\n");
+        sb_str(out, TOOLS_HEAD);
+        for (int t = pool[cr->tools].first; t >= 0; t = pool[t].next) {
+            sb_str(out, "\n");
+            api_pyjson(out, pool, t);
+        }
+        sb_str(out, TOOLS_TAIL);
+        if (sys_first) {
+            char role[16];
+            api_message(pool, first, role, sizeof(role), &c);
+            size_t k = c.n;
+            const char* t = strip(c.p ? c.p : "", &k);
+            if (k) sb_str(out, "\n\n"), sb_add(out, t, k);
+        }
+        sb_str(out, "<|im_end|>\n");
+    } else if (sys_first) {
+        char role[16];
+        api_message(pool, first, role, sizeof(role), &c);
+        size_t k = c.n;
+        const char* t = strip(c.p ? c.p : "", &k);
+        sb_str(out, "<|im_start|>system\n");
+        sb_add(out, t, k);
+        sb_str(out, "<|im_end|>\n");
+    }
+    sb_free(&c);
+    *stable = out->n;
+
+    // the last user message that is a question (not tool results): assistant turns after it keep their thought block
+    int last_query = n - 1, idx = 0, found = -1;
+    for (int m = first; m >= 0; m = pool[m].next, idx++) {
+        if (!role_is(pool, m, "user")) continue;
+        char role[16];
+        sb_init(&c);
+        api_message(pool, m, role, sizeof(role), &c);
+        size_t k = c.n;
+        const char* t = strip(c.p ? c.p : "", &k);
+        const char *a = "<tool_response>", *b = "</tool_response>";
+        if (!(k >= strlen(a) + strlen(b) && !memcmp(t, a, strlen(a)) && !memcmp(t + k - strlen(b), b, strlen(b))))
+            found = idx;
+        sb_free(&c);
+    }
+    if (found >= 0) last_query = found;
+
+    idx = 0;
+    int prev_tool = 0;
+    for (int m = first; m >= 0; m = pool[m].next, idx++) {
+        char role[16];
+        sb_init(&c);
+        if (api_message(pool, m, role, sizeof(role), &c)) {
+            sb_free(&c);
+            *err = "Each message must have a 'role' and a text 'content'.";
+            return -1;
+        }
+        size_t k = c.n;
+        const char* t = strip(c.p ? c.p : "", &k);
+        int is_tool = !strcmp(role, "tool");
+        if (!strcmp(role, "system")) {
+            if (idx != 0) {
+                sb_free(&c);
+                *err = "A system message must be the first.";
+                return -1;
+            }
+        } else if (!strcmp(role, "user")) {
+            sb_str(out, "<|im_start|>user\n");
+            sb_add(out, t, k);
+            sb_str(out, "<|im_end|>\n");
+        } else if (!strcmp(role, "assistant")) {
+            const char* reason = "";
+            size_t rn = 0;
+            int rc = json_get(pool, m, "reasoning_content");
+            Sb rs;
+            sb_init(&rs);
+            const char* te;
+            if (rc >= 0 && pool[rc].type == J_STR) {
+                json_str_sb(pool, rc, &rs);
+                reason = rs.p ? rs.p : "", rn = rs.n;
+            } else if (has(t, k, "</think>", &te)) {   // a thought inside the content
+                const char* th = last_of(t, (size_t)(te - t), "<think>");
+                const char* r0 = th ? th + 7 : t;
+                size_t r = (size_t)(te - r0);
+                while (r && r0[r - 1] == '\n') r--;   // rstrip('\n') then lstrip('\n')
+                while (r && *r0 == '\n') r0++, r--;
+                reason = r0, rn = r;
+                const char* after = last_of(t, k, "</think>") + 8;
+                k -= (size_t)(after - t), t = after;
+                while (k && *t == '\n') t++, k--;
+            }
+            reason = strip(reason, &rn);
+            if (idx > last_query) {
+                sb_str(out, "<|im_start|>assistant\n<think>\n");
+                sb_add(out, reason, rn);
+                sb_str(out, "\n</think>\n\n");
+            } else {
+                sb_str(out, "<|im_start|>assistant\n");
+            }
+            sb_add(out, t, k);
+            size_t kk = k;
+            strip(t, &kk);
+            int calls = json_get(pool, m, "tool_calls");
+            if (calls >= 0 && pool[calls].type == J_ARR)
+                for (int tc = pool[calls].first; tc >= 0; tc = pool[tc].next)
+                    if (render_call(out, pool, tc, tc == pool[calls].first, kk > 0)) {
+                        sb_free(&rs);
+                        sb_free(&c);
+                        *err = "A tool call must have a function name and JSON object arguments.";
+                        return -1;
+                    }
+            sb_str(out, "<|im_end|>\n");
+            sb_free(&rs);
+        } else if (is_tool) {
+            if (idx > 0 && !prev_tool) sb_str(out, "<|im_start|>user");
+            sb_str(out, "\n<tool_response>\n");
+            sb_add(out, t, k);
+            sb_str(out, "\n</tool_response>");
+            int next = pool[m].next;
+            if (next < 0 || !role_is(pool, next, "tool")) sb_str(out, "<|im_end|>\n");
+        } else {
+            sb_free(&c);
+            *err = "A message's role must be system, user, assistant or tool.";
+            return -1;
+        }
+        prev_tool = is_tool;
+        sb_free(&c);
+    }
+    sb_str(out, "<|im_start|>assistant\n");
+    if (think_block) sb_str(out, "<think>\n\n</think>\n\n");
+    if (out->oom) {
+        *err = "Out of memory.";
+        return -1;
+    }
+    return 0;
+}
+
+// ---- the model's tool calls -------------------------------------------------------------------------------------------
+
+// the type the tool's schema gives parameter p of function fn ("" if it says none)
+static void param_type(const JNode* pool, int tools, const char* fn, size_t fl, const char* p, size_t pl, char* type,
+                       size_t cap) {
+    type[0] = 0;
+    if (tools < 0) return;
+    for (int t = pool[tools].first; t >= 0; t = pool[t].next) {
+        int f = json_get(pool, t, "function");
+        int nm = f >= 0 ? json_get(pool, f, "name") : -1;
+        Sb name;
+        sb_init(&name);
+        if (nm >= 0) json_str_sb(pool, nm, &name);
+        int same = name.n == fl && name.p && !memcmp(name.p, fn, fl);
+        sb_free(&name);
+        if (!same) continue;
+        int pr = json_get(pool, f, "parameters");
+        int props = pr >= 0 ? json_get(pool, pr, "properties") : -1;
+        if (props < 0 || pool[props].type != J_OBJ) return;
+        for (int q = pool[props].first; q >= 0; q = pool[q].next) {
+            JNode key = pool[q];
+            key.type = J_STR, key.s = key.key, key.slen = key.klen;
+            Sb kn;
+            sb_init(&kn);
+            json_str_sb(&key, 0, &kn);
+            int hit = kn.n == pl && kn.p && !memcmp(kn.p, p, pl);
+            sb_free(&kn);
+            if (!hit || pool[q].type != J_OBJ) continue;
+            int ty = json_get(pool, q, "type");
+            if (ty >= 0 && pool[ty].type == J_ARR)   // ["integer", "null"]: the first that is not null
+                for (int e = pool[ty].first; e >= 0; e = pool[e].next)
+                    if (pool[e].type == J_STR && !(pool[e].slen == 4 && !memcmp(pool[e].s, "null", 4))) {
+                        ty = e;
+                        break;
+                    }
+            if (ty >= 0 && pool[ty].type == J_STR && pool[ty].slen < cap) {
+                memcpy(type, pool[ty].s, pool[ty].slen);
+                type[pool[ty].slen] = 0;
+            }
+            return;
+        }
+        return;
+    }
+}
+
+static int is_json(const char* v, size_t n, int want) {   // want: a JSON type, or -1 for any
+    JNode pool[256];
+    int r = json_parse(v, n, pool, 256);
+    if (r < 0) {   // (too many nodes for the small pool: try a big one)
+        JNode* big = malloc(sizeof(JNode) * 8192);
+        r = big ? json_parse(v, n, big, 8192) : -1;
+        int t = r >= 0 ? big[r].type : -1;
+        free(big);
+        return r >= 0 && (want < 0 || t == want);
+    }
+    return want < 0 || pool[r].type == want;
+}
+
+// value v (n bytes) as the JSON of its parameter's type
+static void param_json(Sb* out, const char* v, size_t n, const char* type) {
+    size_t k = n;
+    const char* t = strip(v, &k);
+    char num[48];
+    if (!strcmp(type, "integer") || !strcmp(type, "number")) {
+        if (k && k < sizeof(num)) {
+            memcpy(num, t, k);
+            num[k] = 0;
+            char* e;
+            double d = strtod(num, &e);
+            if (!*e && d == d && d - d == 0) {   // (finite)
+                if (!strcmp(type, "integer") && d == (double)(long long)d) snprintf(num, sizeof(num), "%lld", (long long)d);
+                else if (!is_json(t, k, J_NUM)) snprintf(num, sizeof(num), "%.17g", d);
+                sb_str(out, num);
+                return;
+            }
+        }
+    } else if (!strcmp(type, "boolean")) {
+        int yes = ci_eq(t, k, "true") || ci_eq(t, k, "1") || ci_eq(t, k, "yes");
+        int no = ci_eq(t, k, "false") || ci_eq(t, k, "0") || ci_eq(t, k, "no");
+        if (yes || no) {
+            sb_str(out, yes ? "true" : "false");
+            return;
+        }
+    } else if (!strcmp(type, "array") || !strcmp(type, "object")) {
+        int want = type[0] == 'a' ? J_ARR : J_OBJ;
+        if (is_json(t, k, want)) {
+            sb_add(out, t, k);
+            return;
+        }
+        if (want == J_ARR && k) {   // a single item written without the brackets: a list of one
+            sb_str(out, "[");
+            if (is_json(t, k, -1) && !is_json(t, k, J_OBJ) && !is_json(t, k, J_ARR)) sb_add(out, t, k);
+            else sb_json_str(out, v, n);
+            sb_str(out, "]");
+            return;
+        }
+    } else if (!strcmp(type, "null")) {
+        sb_str(out, "null");
+        return;
+    } else if (!type[0]) {   // no type in the schema: JSON if it is an object or a list, else the text
+        if (k && (*t == '{' || *t == '[') && is_json(t, k, -1)) {
+            sb_add(out, t, k);
+            return;
+        }
+    }
+    sb_json_str(out, v, n);
+}
+
+// "<function=NAME>\n<parameter=P>\nvalue\n</parameter>\n...</function>": the arguments' JSON object into args
+static int parse_xml_call(const char* b, size_t n, const JNode* pool, int tools, Sb* name, Sb* args) {
+    const char* f;
+    if (!has(b, n, "<function=", &f)) return -1;
+    f += 10;
+    const char* gt = memchr(f, '>', (size_t)(b + n - f));
+    if (!gt) return -1;
+    size_t fl = (size_t)(gt - f);
+    const char* fn = strip(f, &fl);
+    if (!fl) return -1;
+    sb_add(name, fn, fl);
+    const char* p = gt + 1;
+    const char* end = b + n;
+    const char* fe;
+    if (has(p, (size_t)(end - p), "</function>", &fe)) end = fe;
+    sb_str(args, "{");
+    int count = 0;
+    const char* q;
+    while (has(p, (size_t)(end - p), "<parameter=", &q)) {
+        q += 11;
+        const char* pg = memchr(q, '>', (size_t)(end - q));
+        if (!pg) break;
+        size_t pl = (size_t)(pg - q);
+        const char* pn = strip(q, &pl);
+        const char* v = pg + 1;
+        const char *ve = end, *close = NULL, *nextp;
+        if (has(v, (size_t)(end - v), "</parameter>", &close)) ve = close;
+        if (has(v, (size_t)(ve - v), "<parameter=", &nextp)) ve = nextp;   // (an unclosed parameter ends at the next)
+        size_t vn = (size_t)(ve - v);
+        if (vn && *v == '\n') v++, vn--;   // the template's newline after the tag and before the closing one
+        if (vn && v[vn - 1] == '\n') vn--;
+        char type[16];
+        param_type(pool, tools, fn, fl, pn, pl, type, sizeof(type));
+        if (count++) sb_str(args, ",");
+        sb_json_str(args, pn, pl);
+        sb_str(args, ":");
+        param_json(args, v, vn, type);
+        p = ve == close ? close + 12 : ve;
+    }
+    sb_str(args, "}");
+    return 0;
+}
+
+// the older form: <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+static int parse_json_call(const char* b, size_t n, Sb* name, Sb* args) {
+    JNode* pool = malloc(sizeof(JNode) * 4096);
+    int r = pool ? json_parse(b, n, pool, 4096) : -1;
+    int nm = r >= 0 && pool[r].type == J_OBJ ? json_get(pool, r, "name") : -1;
+    if (nm < 0 || pool[nm].type != J_STR) {
+        free(pool);
+        return -1;
+    }
+    json_str_sb(pool, nm, name);
+    int a = json_get(pool, r, "arguments");
+    if (a < 0) a = json_get(pool, r, "parameters");
+    if (a >= 0 && pool[a].type == J_OBJ) {
+        // compact JSON of the object, from its own text
+        Sb s;
+        sb_init(&s);
+        api_pyjson(&s, pool, a);
+        sb_add(args, s.p, s.n);
+        sb_free(&s);
+    } else if (a >= 0 && pool[a].type == J_STR) {
+        json_str_sb(pool, a, args);
+    } else {
+        sb_str(args, "{}");
+    }
+    free(pool);
+    return 0;
+}
+
+int api_parse_reply(const char* text, size_t n, const JNode* pool, int tools, unsigned id_base, Sb* content, Sb* calls) {
+    const char* tc;
+    size_t before = has(text, n, "<tool_call>", &tc) ? (size_t)(tc - text) : n;
+    size_t k = before;
+    const char* t = strip(text, &k);
+    sb_add(content, t, k);
+    int count = 0;
+    const char* p = text + before;
+    const char* end = text + n;
+    while (has(p, (size_t)(end - p), "<tool_call>", &tc)) {
+        const char* b = tc + 11;
+        const char *be = end, *close = NULL;
+        if (has(b, (size_t)(end - b), "</tool_call>", &close)) be = close;
+        size_t bn = (size_t)(be - b);
+        const char* bs = strip(b, &bn);
+        Sb name, args;
+        sb_init(&name);
+        sb_init(&args);
+        int ok = bn && *bs == '{' ? parse_json_call(bs, bn, &name, &args) : parse_xml_call(b, (size_t)(be - b), pool, tools, &name, &args);
+        if (ok == 0 && name.p && args.p) {
+            char id[48];
+            snprintf(id, sizeof(id), "call_%u_%d", id_base, count);
+            sb_str(calls, count ? ",{\"index\":" : "[{\"index\":");
+            sb_int(calls, count);
+            sb_str(calls, ",\"id\":");
+            sb_json_str(calls, id, strlen(id));
+            sb_str(calls, ",\"type\":\"function\",\"function\":{\"name\":");
+            sb_json_str(calls, name.p, name.n);
+            sb_str(calls, ",\"arguments\":");
+            sb_json_str(calls, args.p, args.n);
+            sb_str(calls, "}}");
+            count++;
+        }
+        sb_free(&name);
+        sb_free(&args);
+        p = be == close ? close + 12 : end;
+    }
+    if (count) sb_str(calls, "]");
+    return count;
+}
+
+// ---- JSON writers with tool calls -----------------------------------------------------------------------------------
+
+void api_json_completion_calls(Sb* out, const char* id, const char* model, long long created, const char* text,
+                               size_t tlen, const char* calls, const char* finish, int prompt_tokens,
+                               int completion_tokens) {
+    sb_str(out, "{\"id\":");
+    sb_json_str(out, id, strlen(id));
+    sb_str(out, ",\"object\":\"chat.completion\",\"created\":");
+    sb_int(out, created);
+    sb_str(out, ",\"model\":");
+    sb_json_str(out, model, strlen(model));
+    sb_str(out, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+    if (calls && !tlen) sb_str(out, "null");
+    else sb_json_str(out, text, tlen);
+    if (calls) {
+        sb_str(out, ",\"tool_calls\":");
+        sb_str(out, calls);
+    }
+    sb_str(out, "},\"finish_reason\":");
+    sb_json_str(out, finish, strlen(finish));
+    sb_str(out, "}],\"usage\":{\"prompt_tokens\":");
+    sb_int(out, prompt_tokens);
+    sb_str(out, ",\"completion_tokens\":");
+    sb_int(out, completion_tokens);
+    sb_str(out, ",\"total_tokens\":");
+    sb_int(out, prompt_tokens + completion_tokens);
+    sb_str(out, "}}");
+}
+
+void api_json_chunk_calls(Sb* out, const char* id, const char* model, long long created, const char* calls) {
+    sb_str(out, "{\"id\":");
+    sb_json_str(out, id, strlen(id));
+    sb_str(out, ",\"object\":\"chat.completion.chunk\",\"created\":");
+    sb_int(out, created);
+    sb_str(out, ",\"model\":");
+    sb_json_str(out, model, strlen(model));
+    sb_str(out, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+    sb_str(out, calls);
+    sb_str(out, "},\"finish_reason\":null}]}");
 }

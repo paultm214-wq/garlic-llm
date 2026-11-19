@@ -3,6 +3,11 @@ Garlic LLM
 Modelos de lenguaje: Qwen3.5-9B y Qwen3.5-4B (Alibaba Qwen), licencia Apache 2.0.
 Voz a texto: Parakeet TDT 0.6B v3, NVIDIA (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3),
              licencia CC-BY 4.0. Pesos cuantizados a 4 bits.
+Palabras de activación (Home Assistant): modelos de openWakeWord (https://github.com/dscripka/openWakeWord),
+             David Scripka y los proyectos Rhasspy / Home Assistant: los de las palabras (okay nabu, hey jarvis,
+             alexa, hey mycroft, hey rhasspy) con licencia CC BY-NC-SA 4.0
+             (https://creativecommons.org/licenses/by-nc-sa/4.0/), uso no comercial; el modelo de embeddings de
+             voz de Google (speech_embedding) y el espectrograma, licencia Apache 2.0. Convertidos a oww.bin.
 Emoji: Twemoji 16.0.1, Copyright 2019 Twitter, Inc. y otros colaboradores,
        https://github.com/jdecked/twemoji, licencia CC-BY 4.0
        (https://creativecommons.org/licenses/by/4.0/). Imágenes escaladas.

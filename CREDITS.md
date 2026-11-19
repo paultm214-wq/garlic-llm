@@ -10,6 +10,8 @@ Garlic LLM's own code is licensed under the GNU General Public License v3.0 (see
 | [Chatterbox Multilingual](https://github.com/resemble-ai/chatterbox) (T3) | Resemble AI | MIT | Text to speech, first stage. Weights quantized to 4 bits. |
 | [Chatterbox-Turbo](https://github.com/resemble-ai/chatterbox) (meanflow S3Gen and HiFT vocoder) | Resemble AI | MIT | Text to speech, second stage. |
 | [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | NVIDIA | CC-BY-4.0 | Speech to text. Weights quantized to 4 bits. |
+| [Speech embedding](https://tfhub.dev/google/speech_embedding/1) (openWakeWord's melspectrogram and embedding models) | Google, re-implemented by David Scripka for [openWakeWord](https://github.com/dscripka/openWakeWord) | Apache-2.0 | Wake words for Home Assistant (`chat/assets/oww.bin`). Weights as published, in float32. |
+| openWakeWord's wake word models (okay nabu, hey jarvis, alexa, hey mycroft, hey rhasspy), as packaged by [pyopen-wakeword](https://github.com/rhasspy/pyopen-wakeword) | David Scripka and the Rhasspy / Home Assistant projects | [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) | Wake words for Home Assistant (`chat/assets/oww.bin`, converted by `pc/convert_openwakeword.py`). Non-commercial: an app that includes them may not be sold. |
 
 ## Voices
 
@@ -21,6 +23,8 @@ Garlic LLM's own code is licensed under the GNU General Public License v3.0 (see
 | Component | Author | Licence |
 |---|---|---|
 | [MicroPython](https://micropython.org) 1.26.1 (`chat/py/mp/`) | Damien P. George and contributors | MIT (`chat/py/mp/LICENSE`) |
+| [openWakeWord](https://github.com/dscripka/openWakeWord)'s and [pyopen-wakeword](https://github.com/rhasspy/pyopen-wakeword)'s streaming method, re-implemented in C (`chat/oww.c`) | David Scripka; Michael Hansen | Apache-2.0 |
+| The [Wyoming protocol](https://github.com/rhasspy/wyoming), implemented in C (`chat/wyoming*.c`) | Michael Hansen (Rhasspy / Open Home Foundation) | MIT |
 | [OpenOrbis PS4 Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain): C library, start-up code and system modules linked into or packaged with the app | The OpenOrbis team | GPLv3 |
 
 ## Data inside the app

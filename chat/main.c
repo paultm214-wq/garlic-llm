@@ -32,6 +32,8 @@
 #include "tokenizer.h"
 #include "pyrun.h"
 #include "ui.h"
+#include "wyoming.h"
+#include "wyoming_proto.h"
 
 #define ASSETS "/app0/assets"
 #define IM_START eng.im_start   // <|im_start|> / <|im_end|> of the loaded model (model.idx)
@@ -325,6 +327,7 @@ static size_t think_len;
 static uint32_t hist_ids[MAX_REPLY + 16];   // the turn as the model keeps it: an empty <think></think>, the answer
 static int hist_n, hist_done;
 static void start_turn(const char* user_text);
+static void api_cache_drop(void);   // the model is used by the chat: the API's kept state is gone (api_run.inc)
 
 static void toast(StrId id) {
     toast_text = tr(id);
@@ -682,6 +685,7 @@ static void system_ahead(int tokens) {
         sys_pre = 0;
         return;
     }
+    api_cache_drop();
     if (sys_pre == 0) {
         sys_n = system_ids(sys_ids, 1024);
         engine_reset(&eng);
@@ -704,6 +708,7 @@ static void start_turn(const char* user_text) {
     int n = 0, max = 8192, think = think_on && !in_voice_mode && eng.qwen35;
     think_t_ask = now();
     sys_pre = 0;   // (a system prompt half read ahead is read again below)
+    api_cache_drop();
     if (pos == 0) {
         engine_reset(&eng);   // a new conversation: clear the Gated DeltaNet states
         n = system_ids(ids, max);
@@ -1666,6 +1671,7 @@ static int spec_lent;
 
 static void spec_lend(void) {
     if (spec_lent || !eng.t3.ready) return;
+    api_cache_drop();   // (the head follows the conversation from here: the API's kept state would not match it)
     double t0 = now();
     if (spec_load(&eng, eng.t3.model, eng.t3.gpu_size, pos) == 0) {   // (it follows the conversation from here)
         spec_lent = 1;
@@ -1676,6 +1682,7 @@ static void spec_lend(void) {
 
 static void voice_mode(void) {
     in_voice_mode = 1;
+    api_cache_drop();   // (the voice takes the context's second half, and the head goes)
 #ifdef GARLIC_SPEC
     if (spec_lent) {   // the MTP head had T3's weights memory: T3 reads its weights again (~3.5 s)
         double t0 = now();
@@ -1791,8 +1798,20 @@ static void boot_report(void) {
 // Off until L3 turns it on, and off again; API_FILE keeps the choice for the next start. While it is on the header
 // shows where it listens. While the model answers a request the conversation gives way to a note, the header shows
 // the speed and Circle stops the reply, as in the chat; with the stick pushed (scrolling) L3 does nothing.
+// The Wyoming server for Home Assistant (wyoming.c: speech to text, text to speech, wake words) goes on and off with
+// the API, unless WY_FILE says 0.
 
 #define API_FILE "/data/garlic_api.txt"   // "1": the API is on when the app starts
+#define WY_FILE "/data/garlic_wyoming.txt"   // "0": the Wyoming server stays off while the API is on
+static void srv_voice_leave(void);   // (wyoming_run.inc)
+
+static int wy_wanted(void) {
+    size_t sz = 0;
+    char* f = (char*)read_all(WY_FILE, &sz);
+    int off = f && sz && f[0] == '0';
+    free(f);
+    return !off;
+}
 // L3 is a click of the stick that also scrolls: it counts only while the stick and the D-pad are at rest
 #define PAD_DIRS (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT)
 
@@ -1807,6 +1826,7 @@ static void api_config(void) {
     int on = f && sz && f[0] == '1';
     free(f);
     if (on) api_enable(1);
+    if (api_enabled() && wy_wanted()) wy_enable(1);
     api_label();
     say("API (L3): %s", api_enabled() ? api_address() : on ? "on in " API_FILE ", but it could not start" : "off");
 }
@@ -1815,6 +1835,12 @@ static void api_toggle(void) {
     static char text[160];
     int on = !api_enabled();
     int failed = api_enable(on) != 0;
+    if (!on) {
+        wy_enable(0);
+        srv_voice_leave();   // (the MTP head back, if the server's voice had its memory)
+    } else if (!failed && wy_wanted()) {
+        wy_enable(1);
+    }
     api_label();
     int f = open(API_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (f >= 0) write(f, api_enabled() ? "1" : "0", 1), close(f);
@@ -1822,6 +1848,10 @@ static void api_toggle(void) {
     else if (!on) snprintf(text, sizeof(text), "%s", tr(S_API_OFF));
     else if (api_address()[0] == ':') snprintf(text, sizeof(text), "%s", tr(S_API_ON));   // (no address to show)
     else snprintf(text, sizeof(text), "%s: http://%s", tr(S_API_ON), api_address());
+    if (on && wy_enabled()) {   // (and Home Assistant's speech services: the same address, port WY_PORT)
+        size_t k = strlen(text);
+        snprintf(text + k, sizeof(text) - k, " · Wyoming %d", WY_PORT);
+    }
     toast_text = text;
     toast_until = now() + 3.0;
     say("toast: %s", text);
@@ -1879,7 +1909,34 @@ static void api_chat_end(void) {
 #endif
 }
 
+// The tokenizer's special tokens for the API's prompts (api_run.inc): is the text of one (<|im_start|>, <tool_call>,
+// <think>...) at p? Its length (the longest that matches) and id, or 0.
+static int api_special(const char* p, size_t n, uint32_t* id) {
+    static uint32_t ids[64];
+    static int n_ids = -1;
+    if (n_ids < 0) {   // (the added tokens, once: 26 in Qwen3.5's vocabulary)
+        n_ids = 0;
+        for (uint32_t i = 0; i < tok.n_vocab && n_ids < 64; i++)
+            if (tok.special[i] && tok.raw_len[i] > 2 && tok.raw[i][0] == '<') ids[n_ids++] = i;
+    }
+    int best = 0;
+    for (int k = 0; k < n_ids; k++) {
+        uint32_t i = ids[k];
+        size_t l = tok.raw_len[i];
+        if (l <= n && (int)l > best && !memcmp(p, tok.raw[i], l)) best = (int)l, *id = i;
+    }
+    return best;
+}
+
+// The text of a special token the model wrote (<tool_call>...), which tok_piece leaves out; 0 for the end tokens.
+static int api_special_text(uint32_t id, const uint8_t** bytes) {
+    if (id >= tok.n_vocab || !tok.special[id] || id == IM_END || id == eng.eos || id == eng.eos2) return 0;
+    *bytes = tok.raw[id];
+    return tok.raw_len[id];
+}
+
 #include "api_run.inc"   // the OpenAI-compatible API's jobs on the model (api.c serves the requests)
+#include "wyoming_run.inc"   // Home Assistant's speech jobs on the GPU (wyoming.c serves the requests)
 
 int main(void) {
     if (rename(LOG_FILE, LOG_PREV)) unlink(LOG_FILE);   // the last log of this app is kept, as LOG_PREV
@@ -1943,6 +2000,7 @@ int main(void) {
     view.temperature = 0.7f;
     think_config();
     api_set_model(MODEL_NAME);
+    wy_services(eng.asr.ready, eng.asr.max_frames * 0.08f - 0.5f, tts_ready);
     api_config();   // the OpenAI-compatible API (api.h), if it was left on; its jobs run in the loop below
 
     uint32_t prev = 0;
@@ -1953,6 +2011,12 @@ int main(void) {
             api_job(api_job_now);
             api_done(api_job_now);
             prev = read_buttons();   // (a button still held from the wait is not a new press)
+        }
+        WyJob* wy_job_now = !generating && !in_voice_mode ? wy_take() : NULL;
+        if (wy_job_now) {   // Home Assistant: speech to text or text to speech, now
+            wy_job(wy_job_now);
+            wy_done(wy_job_now);
+            prev = read_buttons();
         }
         uint32_t buttons = read_buttons();
         uint32_t pressed = buttons & ~prev;
@@ -1986,6 +2050,7 @@ int main(void) {
         else if (pressed & (ORBIS_PAD_BUTTON_R3 | ORBIS_PAD_BUTTON_TOUCH_PAD)) think_toggle();
         else if ((pressed & ORBIS_PAD_BUTTON_L3) && !(buttons & PAD_DIRS)) api_toggle();   // (not while scrolling)
         if (!generating && !(buttons & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))) hist_ahead(8);
+        if (!generating && pos == 0 && api_enabled()) api_idle();   // (the API's system prompt, read again ahead)
         if (!generating && inj_ask_ready) {   // (test aid: "ask" in /data/garlic_keys.txt)
             say("user wrote %d bytes (test file)", (int)strlen(inj_ask));
             start_turn(inj_ask);

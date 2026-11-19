@@ -21,6 +21,8 @@ typedef struct ApiJob {
 // listening; a request already read is still answered). Returns 0, or -1 if it could not be turned on (logged).
 int api_enable(int on);
 int api_enabled(void);
+// The network library loaded and started (once; api_enable does it too). 0, or -1 (logged). For wyoming.c.
+int api_net_setup(void);
 // Where the API listens while it is on: "192.168.1.5:8080", or ":8080" if the console's address is not known.
 const char* api_address(void);
 // Main thread: the job waiting for the model, or NULL. Its reply must be written to job->fd, then api_done(job).

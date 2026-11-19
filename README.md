@@ -19,6 +19,7 @@ Garlic LLM is a homebrew app for the PlayStation 4. It runs [Qwen3.5-9B](https:/
 | **Dictation** | Hold a button and talk instead of typing (Parakeet TDT 0.6B v3), in 25 European languages. |
 | **Python mode** | Ask for a program. It writes MicroPython and the console runs it. |
 | **Think mode** | The model reasons before it answers. Off by default; a thought takes about half a minute. |
+| **Home Assistant server** | An OpenAI-compatible API with tool calling, plus speech to text, text to speech and wake words over the Wyoming protocol. See [Home Assistant](#home-assistant). |
 
 Everything runs on the console. Nothing is sent anywhere.
 
@@ -56,7 +57,7 @@ Other firmware versions are not tested yet. If you try one, please [open an issu
 | L1 | Voice mode |
 | R1 | Run the Python program in the last answer |
 | R3 or touchpad | Think mode on / off |
-| L3 | [API](#api) on / off |
+| L3 | [API](#api) and [Home Assistant](#home-assistant) server on / off |
 | L2 / R2 | Temperature down / up |
 
 After dictating, choose what to do with the text: ✕ send, △ edit, □ record again, ○ discard.
@@ -111,11 +112,47 @@ curl http://192.168.1.5:8080/v1/chat/completions \
 - `GET /v1/models`, `POST /v1/chat/completions` (`stream: true` for server-sent events), `GET /health`.
 - The OpenAPI 3.1 description is at `GET /openapi.json` (also in [`chat/assets/openapi.json`](chat/assets/openapi.json)).
 - Replies are generated the way the chat generates its own, speculative decoding included.
+- Tools work as in OpenAI's API (`tools`, `tool_choice`, `tool_calls`, `role: "tool"` messages). The model gets them in its own chat template and its calls come back as `tool_calls` with `finish_reason: "tool_calls"`. Each argument is typed by the tool's schema.
+- When a request repeats the previous one and continues it (a round of tool calls, a conversation that goes on), the model picks up where the previous request ended instead of reading everything again. After 3 seconds without requests, the console re-reads the last system prompt ahead of time, so the next conversation that uses it only has to read its own messages.
 - One request runs at a time, and the chat screen is busy while it does: it says that a request is being answered, and ○ stops the reply (the client gets what was written so far, with `finish_reason: "length"`). Requests wait while the keyboard, voice mode or a Python program is open.
 - A request is a conversation of its own, so the one on the console's screen is cleared.
-- Reasoning is off. Only `n = 1` is supported; `tools`, `logprobs` and similar parameters are ignored.
+- Reasoning is off. Only `n = 1` is supported; `logprobs` and similar parameters are ignored.
 - For an API key, put it in `/data/garlic_api_key.txt` on the console. Requests then need `Authorization: Bearer <key>`. Without that file, anyone on your network can use the API while it is on, and clients that insist on a key accept any text.
 - If the screen shows `API · :8080`, the app could not read the console's address: it is in *Settings → Network → View Connection Status*.
+
+## Home Assistant
+
+The console can be a dedicated AI server for [Home Assistant](https://www.home-assistant.io). L3 on the chat screen turns on two servers together:
+
+| Port | Protocol | What Home Assistant gets |
+|---|---|---|
+| 8080 | OpenAI-compatible API ([above](#api)) | The conversation agent: Qwen3.5 with tool calling, so it can control your devices |
+| 10300 | [Wyoming](https://github.com/rhasspy/wyoming), the protocol of Home Assistant's Whisper, Piper and openWakeWord add-ons | Speech to text (Parakeet, 25 European languages), text to speech (Garlic's Chatterbox voice in English, Spanish, Portuguese, French, German, Italian and Russian) and wake words (openWakeWord: okay nabu, hey jarvis, alexa, hey mycroft, hey rhasspy) |
+
+Speech to text and text to speech run on the GPU with the app's own models, the same ones as dictation and voice mode. The wake words run on the CPU, roughly a fifth of one core for each satellite that is listening. Nothing leaves your network.
+
+**Set it up**
+
+1. On the console, press **L3** on the chat screen. The message shows the address, for example `API on: http://192.168.1.5:8080 · Wyoming 10300`. The app remembers the setting.
+2. In Home Assistant, go to *Settings → Devices & services → Add integration → Wyoming Protocol*. Enter the console's address and port `10300`. The one entry provides speech to text (`garlic-parakeet`), text to speech (`garlic-chatterbox`) and wake words (`garlic-openwakeword`).
+3. Add the conversation agent. Home Assistant 2026.8 and later include the **LiteLLM** integration, which works with any OpenAI-compatible server. Its URL is `http://192.168.1.5:8080`; leave the API key empty unless you set one (see [API](#api)). Choose the model `Qwen3.5-9B` and, under AI tools, *Device control*. Older versions can use an OpenAI-compatible custom integration from HACS, with `http://192.168.1.5:8080/v1` as the server URL.
+4. In *Settings → Voice assistants*, create an assistant that uses these three: the LiteLLM agent, `garlic-parakeet` and `garlic-chatterbox` (one voice per language, such as `garlic-en`). Choose a wake word if your satellites send their audio to Home Assistant to listen for it; satellites that detect the wake word themselves do not need one.
+
+**Good to know**
+
+- The GPU does one thing at a time. Requests wait in line, and the API label on the chat screen changes colour while the console works on one.
+- The first spoken reply sets up the voice's memory as voice mode does, which takes about 4 seconds once. From then on the language model runs without speculative decoding, at about 22 tokens/s, and its context is 8,192 tokens (4,096 if the TurboQuant cache is off). Turning the server off with L3 restores the chat's full speed.
+- The first command reads Home Assistant's instructions, the list of exposed devices and the tools. That is a few thousand tokens, and the first answer can take tens of seconds. Later commands reuse that work (see [API](#api)), so exposing fewer devices also helps.
+- To keep the Wyoming server off while the API is on, put `0` in `/data/garlic_wyoming.txt`.
+- The wake word models are openWakeWord's, licensed CC BY-NC-SA 4.0 (non-commercial). See [`CREDITS.md`](CREDITS.md).
+
+**Test it from a PC** (Python with `pip install wyoming`):
+
+```bash
+python tests/wyoming_test.py 10300 192.168.1.5 --speech command.wav
+```
+
+This sends Home Assistant's messages and checks the answers. It transcribes `command.wav` (16 kHz mono, 16-bit), speaks a sentence and saves it as `wyoming_tts.wav`, and listens for a wake word. Add `--wake okay_nabu.wav` to check that the wake word is detected in a recording.
 
 ## Build from source
 
@@ -165,7 +202,8 @@ The scripts that made them from the original checkpoints are in `pc/`, and each 
 | `chat/` | The app: engine, user interface, tokenizer, voice, Python runner |
 | `chat/py/` | MicroPython and its port to the console |
 | `shaders/` | The GPU kernels |
-| `pc/` | Converters for the models, reference implementations in NumPy, and the scripts that build the app's data files |
+| `pc/` | Converters for the models, reference implementations in NumPy, and the scripts that build the app's data files (`convert_openwakeword.py` writes `chat/assets/oww.bin`) |
+| `tests/` | Tests that run on a PC: the API's protocol and jobs, the Wyoming protocol and server, and the wake words (each file's header gives its build command) |
 | `build_chat.py` | Builds the PKG |
 
 ## Troubleshooting

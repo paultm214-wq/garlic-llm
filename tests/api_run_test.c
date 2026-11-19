@@ -47,7 +47,7 @@ static int chat_begun, chat_ended, chat_replies, stop_at = -1;
 
 // Scripted reply: the model emits script[k], then IM_END. Tokens 500/501 are the two halves of "é".
 static const uint32_t* script;
-static int script_len, script_k, engine_calls, prompt_len_seen;
+static int script_len, script_k, engine_calls, prompt_len_seen, prompt_from_seen;
 static char wire[1 << 16];
 static size_t wire_n;
 static int wire_fail;   // the client has gone: sends fail
@@ -68,7 +68,8 @@ const char* api_model(void) { return "Qwen3.5-9B"; }
 static void say(const char* fmt, ...) {
     (void)fmt;
 }
-static double now(void) { return 0; }
+static double mock_time;   // seconds (api_idle waits API_REWIND_S after a request)
+static double now(void) { return mock_time; }
 static void api_chat_begin(void) { chat_begun++, msgs_cleared++; }   // (the real one clears the conversation)
 static void api_chat_reply(void) { chat_replies++; }
 static int api_chat_step(int produced) { return stop_at >= 0 && produced >= stop_at; }
@@ -76,7 +77,12 @@ static void api_chat_end(void) { chat_ended++; }
 static int tok_encode(const Tokenizer* t, const char* s, uint32_t* out, int max);
 // as main.c
 static int encode_into(uint32_t* ids, int n, int max, const char* text) { return n + tok_encode(&tok, text, ids + n, max - n); }
-static void engine_reset(MockEngine* e) { (void)e; }
+static int resets;
+static void engine_reset(MockEngine* e) {
+    (void)e;
+    resets++;
+    next_pos = 0;   // (positions start again)
+}
 
 // one byte per token (id = byte + 1), so prompts are easy to count
 static int tok_encode(const Tokenizer* t, const char* s, uint32_t* out, int max) {
@@ -84,6 +90,33 @@ static int tok_encode(const Tokenizer* t, const char* s, uint32_t* out, int max)
     int n = 0;
     for (const char* p = s; *p && n < max; p++) out[n++] = (uint8_t)*p + 1;
     return n;
+}
+// special tokens as the real tokenizer has them (main.c's api_special / api_special_text)
+#define TOOL_CALL 1006u
+#define TOOL_CALL_END 1007u
+static const struct {
+    const char* text;
+    uint32_t id;
+} specials[] = {{"<|im_start|>", IM_START}, {"<|im_end|>", IM_END},     {"<think>", THINK},
+                {"</think>", THINK_END},    {"<tool_call>", TOOL_CALL}, {"</tool_call>", TOOL_CALL_END},
+                {"<tool_response>", 1008},  {"</tool_response>", 1009}};
+static int api_special(const char* p, size_t n, uint32_t* id) {
+    for (size_t k = 0; k < sizeof(specials) / sizeof(specials[0]); k++) {
+        size_t l = strlen(specials[k].text);
+        if (l <= n && !memcmp(p, specials[k].text, l)) {
+            *id = specials[k].id;
+            return (int)l;
+        }
+    }
+    return 0;
+}
+static int api_special_text(uint32_t id, const uint8_t** bytes) {
+    for (size_t k = 0; k < sizeof(specials) / sizeof(specials[0]); k++)
+        if (specials[k].id == id && id != IM_END) {
+            *bytes = (const uint8_t*)specials[k].text;
+            return (int)strlen(specials[k].text);
+        }
+    return 0;
 }
 static int tok_piece(const Tokenizer* t, uint32_t id, const uint8_t** bytes) {
     (void)t;
@@ -115,7 +148,7 @@ static int engine_run(MockEngine* e, const uint32_t* tokens, int n, int pos0, fl
         snprintf(e->error, sizeof(e->error), "mock GPU fault");
         return -1;
     }
-    if (n > 1) prompt_len_seen = n, next_pos = 0;   // the prompt (fed in one go, from position 0)
+    if (n > 1) prompt_len_seen = n, prompt_from_seen = pos0;   // the prompt (fed in one go, after what was kept)
     else fed++;
     if (pos0 != next_pos) pos_errors++;
     next_pos += n;
@@ -323,6 +356,101 @@ static void test_stop(void) {
     CHECK(pos == 0);
 }
 
+// the script of a reply: text as one token per byte, and special tokens
+static uint32_t sbuf[512];
+static int slen;
+static void s_text(const char* t) {
+    for (; *t; t++) sbuf[slen++] = (uint8_t)*t + 1;
+}
+static void s_tok(uint32_t id) { sbuf[slen++] = id; }
+
+#define TOOLS "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"," \
+              "\"properties\":{\"a\":{\"type\":\"integer\"},\"c\":{\"type\":\"array\"}}}}}]"
+#define SYS "{\"role\":\"system\",\"content\":\"You control the house.\"}"
+
+static void test_tools(void) {
+    // a reply that is only a tool call: content null, the call's arguments typed by the schema
+    slen = 0;
+    s_tok(TOOL_CALL);
+    s_text("\n<function=f>\n<parameter=a>\n7\n</parameter>\n<parameter=c>\nlight\n</parameter>\n</function>\n");
+    s_tok(TOOL_CALL_END);
+    run_job("{\"messages\":[" SYS ",{\"role\":\"user\",\"content\":\"go\"}]," TOOLS "}", sbuf, slen);
+    CHECK(strstr(wire, "\"finish_reason\":\"tool_calls\"") != NULL);
+    CHECK(strstr(wire, "\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_") != NULL);
+    CHECK(strstr(wire, "\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":7,\\\"c\\\":[\\\"light\\\"]}\"}") != NULL);
+
+    // streamed, with words before the call: the words stream, the white space before the call does not
+    slen = 0;
+    s_text("On it.\n\n");
+    s_tok(TOOL_CALL);
+    s_text("\n<function=f>\n<parameter=a>\n3\n</parameter>\n</function>\n");
+    s_tok(TOOL_CALL_END);
+    run_job("{\"messages\":[" SYS ",{\"role\":\"user\",\"content\":\"go\"}]," TOOLS ",\"stream\":true}", sbuf, slen);
+    CHECK(strstr(wire, "\"content\":\"O\"") != NULL && strstr(wire, "\"content\":\".\"") != NULL);
+    CHECK(strstr(wire, "\\n") == NULL);   // (no newline was streamed: the two before the call were held back)
+    CHECK(strstr(wire, "<function") == NULL);
+    const char* tc = strstr(wire, "\"delta\":{\"tool_calls\":[{\"index\":0,");
+    CHECK(tc != NULL && strstr(tc, "\"arguments\":\"{\\\"a\\\":3}\"") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"tool_calls\"") > tc && strstr(wire, "data: [DONE]") != NULL);
+
+    // a streamed reply without a tool call keeps its white space
+    slen = 0;
+    s_text("A \nB\n");
+    run_job("{\"messages\":[" SYS ",{\"role\":\"user\",\"content\":\"go\"}]," TOOLS ",\"stream\":true}", sbuf, slen);
+    CHECK(strstr(wire, "\"content\":\"A\"") != NULL && strstr(wire, "\"content\":\" \\nB\"") != NULL);
+    CHECK(strstr(wire, "\"content\":\"\\n\"") != NULL && strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+}
+
+// Home Assistant's round of tool calls: the second request repeats the first and its call, then the result. The model
+// goes on from where the first request left it (nothing read twice). Idle, it reads the system turn again, and a new
+// conversation with the same system turn and tools starts after it.
+static void test_reuse(void) {
+    slen = 0;
+    s_tok(TOOL_CALL);
+    s_text("\n<function=f>\n<parameter=a>\n7\n</parameter>\n</function>\n");
+    s_tok(TOOL_CALL_END);
+    int r0 = resets;
+    run_job("{\"messages\":[" SYS ",{\"role\":\"user\",\"content\":\"turn it on\"}]," TOOLS "}", sbuf, slen);
+    CHECK(resets == r0 + 1 && prompt_from_seen == 0);
+    int first_len = prompt_len_seen, kept = api_seq_n;
+    CHECK(kept == first_len + slen);   // the prompt and every token of the call (the last <|im_end|> is not read)
+    slen = 0;
+    s_text("Done.");
+    run_job("{\"messages\":[" SYS ",{\"role\":\"user\",\"content\":\"turn it on\"},"
+            "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1_0\",\"type\":\"function\","
+            "\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\": 7}\"}}]},"
+            "{\"role\":\"tool\",\"tool_call_id\":\"call_1_0\",\"content\":\"ok\"}]," TOOLS "}", sbuf, slen);
+    CHECK(strstr(wire, "\"content\":\"Done.\"") != NULL && strstr(wire, "\"finish_reason\":\"stop\"") != NULL);
+    CHECK(resets == r0 + 1);                          // not started again...
+    CHECK(prompt_from_seen == kept);                  // ...but continued where the first request ended
+    CHECK(prompt_len_seen > 0 && prompt_len_seen < 60);   // (only "<|im_end|>\n<|im_start|>user\n<tool_response>..." read)
+
+    // idle: nothing before API_REWIND_S, then the system turn again, 16 tokens at a time
+    int sys = api_sys_n;
+    CHECK(sys > 0 && api_seq_n > sys);
+    mock_time = api_last_t + 1;
+    api_idle();
+    CHECK(resets == r0 + 1 && api_seq_n > sys);
+    mock_time = api_last_t + 10;
+    for (int i = 0; i < 200 && (api_rewinding || api_seq_n != sys); i++) api_idle();
+    CHECK(resets == r0 + 2 && api_seq_n == sys && !api_rewinding);
+    // a new conversation: only its own messages are read
+    slen = 0;
+    s_text("Hi!");
+    run_job("{\"messages\":[" SYS ",{\"role\":\"user\",\"content\":\"hello\"}]," TOOLS "}", sbuf, slen);
+    CHECK(resets == r0 + 2 && prompt_from_seen == sys);
+    // another system prompt: from the start
+    run_job("{\"messages\":[{\"role\":\"system\",\"content\":\"Other.\"},{\"role\":\"user\",\"content\":\"hello\"}]," TOOLS "}",
+            sbuf, slen);
+    CHECK(resets == r0 + 3 && prompt_from_seen == 0);
+    // the chat used the model meanwhile: from the start
+    api_cache_drop();
+    run_job("{\"messages\":[{\"role\":\"system\",\"content\":\"Other.\"},{\"role\":\"user\",\"content\":\"hello\"},"
+            "{\"role\":\"assistant\",\"content\":\"x\"},{\"role\":\"user\",\"content\":\"y\"}]," TOOLS "}", sbuf, slen);
+    CHECK(resets == r0 + 4 && prompt_from_seen == 0);
+    mock_time = 0;
+}
+
 static void test_utf8(void) {
     CHECK(api_utf8_whole((const uint8_t*)"\xc3", 1) == 0);
     CHECK(api_utf8_whole((const uint8_t*)"a\xc3", 2) == 1);
@@ -342,6 +470,8 @@ int main(void) {
         test_client_gone();
         test_spec();
         test_stop();
+        test_tools();
+        test_reuse();
         CHECK(pos_errors == 0);            // every token went in at the position after the one before
         CHECK(chat_begun == chat_ended);   // every request that took the screen gave it back
         CHECK(chat_replies <= chat_begun);

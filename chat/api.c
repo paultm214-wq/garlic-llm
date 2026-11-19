@@ -337,6 +337,8 @@ static void find_address(void) {
     sceNetSocketClose(s);
 }
 
+int api_net_setup(void) { return api_setup(); }
+
 int api_enabled(void) { return on; }
 
 const char* api_address(void) { return address; }

@@ -43,7 +43,7 @@ typedef struct JNode {
     uint8_t type;
     int b;                      // J_BOOL value
     double num;                 // J_NUM value
-    const char* s;              // J_STR: the raw text between the quotes (escapes not decoded)
+    const char* s;              // J_STR: the raw text between the quotes (escapes not decoded); J_NUM: as written
     size_t slen;
     const char* key;            // member name in an object (raw, as above)
     size_t klen;
@@ -73,7 +73,8 @@ void api_json_chunk(Sb* out, const char* id, const char* model, long long create
 void api_json_error(Sb* out, const char* message, const char* type, const char* code);
 
 // ---- chat request -------------------------------------------------------------------------------------------------
-#define API_MAX_NODES 1024
+// (Home Assistant sends a tool schema per intent with long enum lists: a request can have thousands of JSON nodes)
+#define API_MAX_NODES 16384
 typedef struct {
     int root;                   // root node (in the pool the caller gives)
     int messages;               // the messages array node (-1 if missing)
@@ -83,10 +84,38 @@ typedef struct {
     int stream;                 // 0 or 1
     unsigned seed;              // default 0 = the engine's own seed
     int has_seed;
+    int tools;                  // the tools array node, -1 if none (or tool_choice is "none")
 } ChatRequest;
 
 // Reads a chat.completions body. Returns 0 if valid (fills req; messages are pool nodes, each an object with role
 // and content), or -1 with the reason in err (a fixed string, for the 400 answer).
 int api_chat_parse(const char* body, size_t len, JNode* pool, int max, ChatRequest* req, const char** err);
+
+// ---- Qwen3.5's chat template ----------------------------------------------------------------------------------------
+// The request as the model's chat template writes it (Qwen3.5-9B's chat_template.jinja, with enable_thinking false):
+// the tools in the system turn, earlier tool calls as <tool_call><function=...><parameter=...> blocks, tool results
+// as <tool_response> in a user turn, then the assistant's turn with an empty thought block (think_block 0: without it,
+// for models that have none). Special tokens are written as their text (<|im_start|>, <tool_call>...): the caller
+// tokenizes them as special tokens. *stable: the bytes of out that every request with the same system message and
+// tools starts with (the system turn). Returns 0, or -1 with the reason in err.
+int api_render(const JNode* pool, const ChatRequest* req, int think_block, Sb* out, size_t* stable, const char** err);
+// A JSON value as Python's json.dumps writes it (", " and ": " between items, non-ASCII as is): the template's tojson.
+void api_pyjson(Sb* out, const JNode* pool, int node);
+
+// The model's reply split into its text and its tool calls (<tool_call><function=NAME><parameter=P>value</parameter>
+// ...</function></tool_call>, or the older JSON form {"name", "arguments"}). Each parameter's value becomes JSON by the
+// type the tool's schema gives it (string, integer, number, boolean, array, object). content: the text before the
+// first call, trimmed. calls: the JSON array of OpenAI tool calls ({"id": "call_<id_base>_<i>", "type": "function",
+// "function": {"name", "arguments": "<JSON object as a string>"}}), or nothing if there are none. Returns the number of
+// calls. pool/tools: the request's tools (tools -1: every value is a string unless it is JSON).
+int api_parse_reply(const char* text, size_t n, const JNode* pool, int tools, unsigned id_base, Sb* content, Sb* calls);
+
+// ---- JSON writers with tool calls -----------------------------------------------------------------------------------
+// A chat.completion with tool calls (calls: a JSON array, or NULL): content is null when empty and there are calls.
+void api_json_completion_calls(Sb* out, const char* id, const char* model, long long created, const char* text,
+                               size_t tlen, const char* calls, const char* finish, int prompt_tokens,
+                               int completion_tokens);
+// The streamed chunk that carries the tool calls (each with its "index").
+void api_json_chunk_calls(Sb* out, const char* id, const char* model, long long created, const char* calls);
 
 #endif

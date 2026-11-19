@@ -142,11 +142,103 @@ static void test_writers(void) {
     sb_free(&s);
 }
 
+static JNode tpool[API_MAX_NODES];
+
+// the tool calls of a reply: arguments typed by the tools' schemas
+static void test_tool_calls(void) {
+    const char* body =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"HassLightSet\",\"parameters\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},"
+        "\"brightness\":{\"type\":\"integer\"},\"ratio\":{\"type\":\"number\"},\"on\":{\"type\":\"boolean\"},"
+        "\"domain\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"extra\":{\"type\":\"object\"},"
+        "\"volume\":{\"type\":[\"number\",\"null\"]},\"free\":{}}}}}]}";
+    ChatRequest req;
+    const char* err = NULL;
+    CHECK(api_chat_parse(body, strlen(body), tpool, API_MAX_NODES, &req, &err) == 0 && req.tools >= 0);
+    const char* reply =
+        "  Setting it.  \n\n<tool_call>\n<function=HassLightSet>\n<parameter=name>\nKitchen \"Light\"\n</parameter>\n"
+        "<parameter=brightness>\n50\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=on>\nTrue\n"
+        "</parameter>\n<parameter=domain>\n[\"light\", \"switch\"]\n</parameter>\n<parameter=extra>\n{\"a\": 1}\n"
+        "</parameter>\n<parameter=volume>\n7\n</parameter>\n<parameter=free>\n[1,2]\n</parameter>\n<parameter=gone>\n"
+        "line one\nline two\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=HassLightSet>\n"
+        "<parameter=domain>\nlight\n</parameter>\n<parameter=brightness>\nlots\n</parameter>\n</function>\n</tool_call>";
+    Sb content, calls;
+    sb_init(&content);
+    sb_init(&calls);
+    int n = api_parse_reply(reply, strlen(reply), tpool, req.tools, 9, &content, &calls);
+    CHECK(n == 2);
+    CHECK(content.p && !strcmp(content.p, "Setting it."));
+    CHECK(calls.p && strstr(calls.p, "[{\"index\":0,\"id\":\"call_9_0\",\"type\":\"function\",\"function\":"
+                                     "{\"name\":\"HassLightSet\",\"arguments\":") == calls.p);
+    // the arguments, as the JSON string they are sent in
+    CHECK(strstr(calls.p, "\"{\\\"name\\\":\\\"Kitchen \\\\\\\"Light\\\\\\\"\\\",\\\"brightness\\\":50,\\\"ratio\\\":0.5,"
+                          "\\\"on\\\":true,\\\"domain\\\":[\\\"light\\\", \\\"switch\\\"],\\\"extra\\\":{\\\"a\\\": 1},"
+                          "\\\"volume\\\":7,\\\"free\\\":[1,2],\\\"gone\\\":\\\"line one\\\\nline two\\\"}\"") != NULL);
+    // a list written without brackets becomes a list of one; a number that is not one stays text
+    CHECK(strstr(calls.p, "{\"index\":1,\"id\":\"call_9_1\"") != NULL);
+    CHECK(strstr(calls.p, "\"{\\\"domain\\\":[\\\"light\\\"],\\\"brightness\\\":\\\"lots\\\"}\"") != NULL);
+    sb_free(&content);
+    sb_free(&calls);
+
+    // the older JSON form, no text before it, and an unclosed call at the end
+    const char* js = "<tool_call>\n{\"name\": \"GetLiveContext\", \"arguments\": {}}\n</tool_call><tool_call>\n"
+                     "<function=HassTurnOn>\n<parameter=name>\nFan";
+    sb_init(&content);
+    sb_init(&calls);
+    CHECK(api_parse_reply(js, strlen(js), tpool, req.tools, 1, &content, &calls) == 2);
+    CHECK(content.n == 0);
+    CHECK(strstr(calls.p, "\"name\":\"GetLiveContext\",\"arguments\":\"{}\"") != NULL);
+    CHECK(strstr(calls.p, "\"name\":\"HassTurnOn\",\"arguments\":\"{\\\"name\\\":\\\"Fan\\\"}\"") != NULL);
+    sb_free(&content);
+    sb_free(&calls);
+
+    // no call: all of it is content; nothing in calls
+    sb_init(&content);
+    sb_init(&calls);
+    CHECK(api_parse_reply("Just text.", 10, tpool, -1, 1, &content, &calls) == 0);
+    CHECK(content.p && !strcmp(content.p, "Just text.") && calls.n == 0);
+    sb_free(&content);
+    sb_free(&calls);
+
+    // tools: refused when malformed, left out with tool_choice none
+    const char* bad = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":{}}";
+    CHECK(api_chat_parse(bad, strlen(bad), tpool, API_MAX_NODES, &req, &err) == -1);
+    const char* noname = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\"}]}";
+    CHECK(api_chat_parse(noname, strlen(noname), tpool, API_MAX_NODES, &req, &err) == -1);
+    const char* none = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tool_choice\":\"none\",\"tools\":"
+                       "[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}";
+    CHECK(api_chat_parse(none, strlen(none), tpool, API_MAX_NODES, &req, &err) == 0 && req.tools == -1);
+
+    // the writers
+    Sb w;
+    sb_init(&w);
+    api_json_completion_calls(&w, "c", "m", 1, "", 0, "[{\"index\":0}]", "tool_calls", 3, 4);
+    CHECK(w.p && strstr(w.p, "\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0}]},"
+                             "\"finish_reason\":\"tool_calls\"") != NULL);
+    sb_free(&w);
+    api_json_chunk_calls(&w, "c", "m", 1, "[{\"index\":0}]");
+    CHECK(w.p && strstr(w.p, "\"delta\":{\"tool_calls\":[{\"index\":0}]},\"finish_reason\":null") != NULL);
+    sb_free(&w);
+}
+
+// Python's json.dumps of a tool, as the template writes the tools (", " and ": ", numbers as written)
+static void test_pyjson(void) {
+    const char* doc = "{\"a\":[1,2.50,-3e2,true,null],\"s\":\"caf\\u00e9\\n\\t\\b\\f\\u0001\",\"o\":{}}";
+    int r = json_parse(doc, strlen(doc), tpool, 64);
+    Sb s;
+    sb_init(&s);
+    api_pyjson(&s, tpool, r);
+    CHECK(s.p && !strcmp(s.p, "{\"a\": [1, 2.50, -3e2, true, null], \"s\": \"caf\xc3\xa9\\n\\t\\b\\f\\u0001\", \"o\": {}}"));
+    sb_free(&s);
+}
+
 int main(void) {
     test_http();
     test_json();
     test_chat();
     test_writers();
+    test_tool_calls();
+    test_pyjson();
     printf("%d checks, %d failed\n", checks, fails);
     return fails != 0;
 }
